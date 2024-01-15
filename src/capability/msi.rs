@@ -1,4 +1,8 @@
-use crate::{capability::PciCapabilityAddress, ConfigRegionAccess};
+use crate::{
+    capability::CapabilityHeader,
+    DwordAccessMethod, AccessorTrait,
+    map_field,
+};
 use bit_field::BitField;
 use core::convert::TryFrom;
 
@@ -6,6 +10,7 @@ use core::convert::TryFrom;
 /// Device will modify lower bits of interrupt vector to send multiple messages, so interrupt block
 /// must be aligned accordingly.
 #[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
+#[repr(u8)]
 pub enum MultipleMessageSupport {
     /// Device can send 1 interrupt. No interrupt vector modification is happening here
     Int1 = 0b000,
@@ -45,141 +50,236 @@ pub enum TriggerMode {
     LevelDeassert = 0b10,
 }
 
-#[derive(Debug, Clone)]
-pub struct MsiCapability {
-    address: PciCapabilityAddress,
-    per_vector_masking: bool,
-    is_64bit: bool,
-    multiple_message_capable: MultipleMessageSupport,
-}
-
-impl MsiCapability {
-    pub(crate) fn new(address: PciCapabilityAddress, control: u16) -> MsiCapability {
-        MsiCapability {
-            address,
-            per_vector_masking: control.get_bit(8),
-            is_64bit: control.get_bit(7),
-            multiple_message_capable:
-                MultipleMessageSupport::try_from(control.get_bits(1..4) as u8)
-                    .unwrap_or(MultipleMessageSupport::Int1),
-        }
+#[derive(Clone, Copy, Debug)]
+#[repr(transparent)]
+pub struct MessageControl(u16);
+impl MessageControl {
+    pub fn new(raw: u16) -> Self {
+        Self(raw)
     }
 
-    /// Does device supports masking individual vectors?
-    #[inline]
-    pub fn has_per_vector_masking(&self) -> bool {
-        self.per_vector_masking
+    pub fn msi_enable(&self) -> bool {
+        self.0.get_bit(0)
+    }
+    pub fn set_msi_enable(&mut self) {
+        self.0.set_bit(0, true);
+    }
+    pub fn clear_msi_enable(&mut self) {
+        self.0.set_bit(0, false);
     }
 
-    /// Is device using 64-bit addressing?
-    #[inline]
-    pub fn is_64bit(&self) -> bool {
-        self.is_64bit
+    pub fn multiple_message_capable(&self) -> MultipleMessageSupport {
+        MultipleMessageSupport::try_from(self.0.get_bits(1..=3) as u8)
+            .unwrap()
     }
-
-    /// How many interrupts this device has?
-    #[inline]
-    pub fn get_multiple_message_capable(&self) -> MultipleMessageSupport {
-        self.multiple_message_capable
-    }
-
-    /// Is MSI capability enabled?
-    pub fn is_enabled(&self, access: &impl ConfigRegionAccess) -> bool {
-        let reg = unsafe { access.read(self.address.address, self.address.offset) };
-        reg.get_bit(0)
-    }
-
-    /// Enable or disable MSI capability
-    pub fn set_enabled(&self, enabled: bool, access: &impl ConfigRegionAccess) {
-        let mut reg = unsafe { access.read(self.address.address, self.address.offset) };
-        reg.set_bit(0, enabled);
-        unsafe { access.write(self.address.address, self.address.offset, reg) };
-    }
-
-    /// Set how many interrupts the device will use. If requested count is bigger than supported count,
-    /// the second will be used.
-    pub fn set_multiple_message_enable(
-        &self,
-        data: MultipleMessageSupport,
-        access: &impl ConfigRegionAccess,
-    ) {
-        let mut reg = unsafe { access.read(self.address.address, self.address.offset) };
-        reg.set_bits(4..7, (data.min(self.multiple_message_capable)) as u32);
-        unsafe { access.write(self.address.address, self.address.offset, reg) };
-    }
-
-    /// Return how many interrupts the device is using
-    pub fn get_multiple_message_enable(
-        &self,
-        access: &impl ConfigRegionAccess,
-    ) -> MultipleMessageSupport {
-        let reg = unsafe { access.read(self.address.address, self.address.offset) };
-        MultipleMessageSupport::try_from(reg.get_bits(4..7) as u8)
+    pub fn multiple_message_enable(&self) -> MultipleMessageSupport {
+        MultipleMessageSupport::try_from(self.0.get_bits(4..=6) as u8)
             .unwrap_or(MultipleMessageSupport::Int1)
     }
+    /// Set how many interrupts the device will use.
+    /// If request count is greater than capability, then the capability will be used.
+    pub fn set_multiple_message_enable(&mut self, value: MultipleMessageSupport) {
+        self.0.set_bits(
+            4..=6,
+            value.min(self.multiple_message_capable()) as u16
+        );
+    }
 
-    /// Set where the interrupts will be sent to
-    ///
-    /// # Arguments
-    /// * `address` - Target Local APIC address (if not changed, can be calculated with `0xFEE00000 | (processor << 12)`)
-    /// * `vector` - Which interrupt vector should be triggered on LAPIC
-    /// * `trigger_mode` - When interrupt should be triggered
-    /// * `access` - PCI Configuration Space accessor
-    pub fn set_message_info(
-        &self,
-        address: u32,
-        vector: u8,
-        trigger_mode: TriggerMode,
-        access: &impl ConfigRegionAccess,
-    ) {
-        unsafe { access.write(self.address.address, self.address.offset + 0x4, address) }
-        let data_offset = if self.is_64bit { 0xC } else { 0x8 };
-        let mut data =
-            unsafe { access.read(self.address.address, self.address.offset + data_offset) };
-        data.set_bits(0..8, vector as u32);
-        data.set_bits(14..16, trigger_mode as u32);
-        unsafe {
-            access.write(
-                self.address.address,
-                self.address.offset + data_offset,
+    pub fn is_64bit(&self) -> bool {
+        self.0.get_bit(7)
+    }
+
+    pub fn has_per_vector_masking(&self) -> bool {
+        self.0.get_bit(8)
+    }
+}
+
+/// MSI message data.
+#[derive(Clone, Copy, Debug)]
+#[repr(transparent)]
+pub struct MessageData(u32); // upper 16 bits should be rsvdz.
+impl MessageData {
+    pub fn new(vector: u8, trigger_mode: TriggerMode) -> Self {
+        Self(
+            *(vector as u32).set_bits(14..=15, trigger_mode as u32),
+        )
+    }
+}
+
+/// The generic MSI Capability Header.
+/// 
+/// The generic parameter `N` should be either 1 or 2.
+/// Users are not supposed to feed `N` directly.
+/// Instead, use [`MsiCapability32Bit`] and [`MsiCapability64Bit`].
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct MsiCapability<const N: usize> { // todo: instead of using generics, construct separate type for 32-bit and 64-bit.
+    /// Capability Header. Offset 0x00.
+    pub header: CapabilityHeader<MessageControl>,
+    /// Address Part, with one dword(32-bit) and two dwords(64-bit). Offset 0x04.
+    pub addr: [u32; N],
+    /// Message Data. Offset 0x08 (32-bit) / 0x0C (64-bit).
+    pub data: MessageData,
+    /// Mask Bits, only valid in 64-bit mode and when per-vector masking is enabled.
+    /// Offset 0x10.
+    pub mask_bits: u32,
+    /// Pending Bits, only valid in 64-bit mode.
+    /// Offset 0x14.
+    pub pending_bits: u32,
+}
+
+pub type MsiCapability32Bit = MsiCapability<1>;
+pub type MsiCapability64Bit = MsiCapability<2>;
+pub type MsiCapabilityInfo = MsiCapability64Bit;
+
+impl<const N: usize> MsiCapability<N> {
+    /// Converts a cap header accessor into MSI cap accessor.
+    /// 
+    /// Note that there are actually TWO converter methods,
+    /// namely `MsiCapability32Bit::from_header` and `MsiCapability64Bit::from_header`.
+    /// 
+    /// Since we can check the address size only once,
+    /// using `read_info` and `write_info` are preferred,
+    pub fn from_header<'a, M>(cap_header_acc: &impl AccessorTrait<'a, M, CapabilityHeader>) -> Option<impl AccessorTrait<'a, M, Self>>
+    where
+        M: DwordAccessMethod,
+    {
+        let header: CapabilityHeader = cap_header_acc.read();
+
+        if header.id == 0x05 { // todo: define MSI Cap header ID = 0x05 somewhere
+            let ctrl = MessageControl::new(header.extension);
+            if ctrl.is_64bit() == (N != 1) {
+                Some(cap_header_acc.cast())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+}
+
+impl MsiCapabilityInfo {
+    /// Determine if this header is MSI Capability.
+    /// 0 if this is not MSI, 1 if 32-bit, 2 if 64-bit.
+    pub fn msi_cap_type<'a, M>(cap_header_acc: &impl AccessorTrait<'a, M, CapabilityHeader>) -> usize
+    where
+        M: DwordAccessMethod,
+    {
+        let CapabilityHeader { id, next: _, extension } = cap_header_acc.read();
+        if id != 0x05 { // todo: define MSI Cap header ID = 0x05 somewhere
+            return 0;
+        }
+
+        let ctrl = MessageControl::new(extension);
+        if !ctrl.is_64bit() { 1 } else { 2 }
+    }
+
+    /// Read the MSI Capability info from given cap header.
+    /// 
+    /// Panics if the header is not MSI header.
+    pub fn read_info<'a, M>(cap_header_acc: &impl AccessorTrait<'a, M, CapabilityHeader>) -> Self
+    where
+        M: DwordAccessMethod,
+    {
+        let CapabilityHeader { id, next, extension } = cap_header_acc.read();
+        assert_eq!(id, 0x05); // todo: define MSI Cap header ID = 0x05 somewhere
+
+        let ctrl = MessageControl::new(extension);
+        let header = CapabilityHeader::<MessageControl> { id, next, extension: ctrl };
+        
+        if !ctrl.is_64bit() { // 32-bit
+            let casted = cap_header_acc.cast::<MsiCapability32Bit>();
+
+            let addr0 = map_field!(casted.addr[0]).read();
+            let data = map_field!(casted.data).read(); // padding should be zero, so no need to read.
+
+            MsiCapability64Bit {
+                header,
+                addr: [addr0, 0],
                 data,
+                mask_bits: 0,
+                pending_bits: 0,
+            }
+        } else {
+            let casted = cap_header_acc.cast::<MsiCapability64Bit>();
+
+            let addr0 = map_field!(casted.addr[0]).read();
+            let addr1 = map_field!(casted.addr[1]).read();
+            let data = map_field!(casted.data).read(); // padding should be zero, so no need to read.
+            let mask_bits = map_field!(casted.mask_bits).read();
+            let pending_bits = map_field!(casted.pending_bits).read();
+
+            MsiCapability64Bit {
+                header,
+                addr: [addr0, addr1],
+                data,
+                mask_bits,
+                pending_bits,
+            }
+
+            // // in this branch, this also works (read header twice though)
+            // cap_header_acc.cast::<MsiCapability64Bit>().read()
+        }
+    }
+
+    /// Write the MSI Capability info into given cap header.
+    /// 
+    /// Panics if the header is not MSI header.
+    pub fn write_info<'a, M>(cap_header_acc: &impl AccessorTrait<'a, M, CapabilityHeader>, info: Self)
+    where
+        M: DwordAccessMethod,
+    {
+        let CapabilityHeader { id, next, extension } = cap_header_acc.read();
+        assert_eq!(id, 0x05); // todo: define MSI Cap header ID = 0x05 somewhere
+        assert_eq!(info.header.id, id);
+        assert_eq!(info.header.next, next);
+
+        let ctrl = MessageControl::new(extension);
+        assert_eq!(
+            info.header.extension.is_64bit(),
+            ctrl.is_64bit(),
+        );
+
+        if !ctrl.is_64bit() { // 32-bit
+            let casted = cap_header_acc.cast::<MsiCapability32Bit>();
+
+            map_field!(casted.header).write(info.header);
+            map_field!(casted.addr[0]).write(info.addr[0]);
+            map_field!(casted.data).write(info.data);
+        } else { // 64-bit
+            let casted = cap_header_acc.cast::<MsiCapability64Bit>();
+
+            map_field!(casted.header).write(info.header);
+            map_field!(casted.addr[0]).write(info.addr[0]);
+            map_field!(casted.addr[1]).write(info.addr[1]);
+            map_field!(casted.data).write(info.data);
+            // map_field!(casted.mask_bits).write(info.mask_bits);
+            // map_field!(casted.pending_bits).write(info.pending_bits);
+
+            // // or one-liner:
+            // casted.write(info);
+        }
+    }
+
+    /// Updates the MSI Capability info on given cap header.
+    /// 
+    /// Panics if the header is not MSI header.
+    pub fn update_info<'a, M, F>(cap_header_acc: &impl AccessorTrait<'a, M, CapabilityHeader>, f: F)
+    where
+        M: DwordAccessMethod,
+        F: FnOnce(Self) -> Self,
+    {
+        // use core::hint::black_box;
+
+        // let updated = black_box(f(black_box(Self::read_info(cap_header_acc))));
+        // black_box(Self::write_info(cap_header_acc, updated));
+
+        Self::write_info(
+            cap_header_acc,
+            f(
+                Self::read_info(cap_header_acc)
             )
-        }
-    }
-
-    /// Get interrupt mask
-    ///
-    /// # Note
-    /// Only supported on when device supports 64-bit addressing and per-vector masking. Otherwise
-    /// returns `0`
-    pub fn get_message_mask(&self, access: &impl ConfigRegionAccess) -> u32 {
-        if self.is_64bit && self.per_vector_masking {
-            unsafe { access.read(self.address.address, self.address.offset + 0x10) }
-        } else {
-            0
-        }
-    }
-
-    /// Set interrupt mask
-    ///
-    /// # Note
-    /// Only supported on when device supports 64-bit addressing and per-vector masking. Otherwise
-    /// will do nothing
-    pub fn set_message_mask(&self, access: &impl ConfigRegionAccess, mask: u32) {
-        if self.is_64bit && self.per_vector_masking {
-            unsafe { access.write(self.address.address, self.address.offset + 0x10, mask) }
-        }
-    }
-
-    /// Get pending interrupts
-    ///
-    /// # Note
-    /// Only supported on when device supports 64-bit addressing. Otherwise will return `0`
-    pub fn get_pending(&self, access: &impl ConfigRegionAccess) -> u32 {
-        if self.is_64bit {
-            unsafe { access.read(self.address.address, self.address.offset + 0x14) }
-        } else {
-            0
-        }
+        );
     }
 }

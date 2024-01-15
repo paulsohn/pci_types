@@ -1,4 +1,3 @@
-use crate::{BaseClass, Interface, SubClass};
 use core::convert::TryFrom;
 
 /// Combines the Base Class and the Sub-class of a device to classify it into a `DeviceType`. Combined with the
@@ -184,9 +183,9 @@ pub enum DeviceType {
     OtherSignalProcessingController,
 }
 
-impl From<(BaseClass, SubClass)> for DeviceType {
-    fn from(class: (BaseClass, SubClass)) -> Self {
-        match class {
+impl From<(u8, u8)> for DeviceType {
+    fn from(base_sub: (u8, u8)) -> Self {
+        match base_sub {
             (0x00, 0x00) => DeviceType::LegacyNotVgaCompatible,
             (0x00, 0x01) => DeviceType::LegacyVgaCompatible,
 
@@ -313,8 +312,8 @@ impl From<(BaseClass, SubClass)> for DeviceType {
     }
 }
 
-/// The different register-level programming interfaces defined for USB controllers (devices of type
-/// `DeviceType::UsbController`).
+/// The different register-level programming interfaces defined for USB controllers
+/// (devices of type [`DeviceType::UsbController`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum UsbType {
     Uhci,
@@ -325,10 +324,10 @@ pub enum UsbType {
     Device,
 }
 
-impl TryFrom<Interface> for UsbType {
+impl TryFrom<u8> for UsbType {
     type Error = ();
 
-    fn try_from(interface: Interface) -> Result<Self, Self::Error> {
+    fn try_from(interface: u8) -> Result<Self, Self::Error> {
         match interface {
             0x00 => Ok(UsbType::Uhci),
             0x10 => Ok(UsbType::Ohci),
