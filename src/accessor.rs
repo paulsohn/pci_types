@@ -130,7 +130,7 @@ where
                 let slice = &raw[(start_pos as usize)..=(end_pos as usize)];
 
                 let mut buf = MaybeUninit::<T>::uninit();
-                MaybeUninit::write_slice(buf.as_bytes_mut(), slice);
+                MaybeUninit::copy_from_slice(buf.as_bytes_mut(), slice);
 
                 buf.assume_init()
             }
